@@ -1,0 +1,14 @@
+# .gitignore
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.env
+.venv
+*.log
+.DS_Store
+
+# Data (keep structure but not raw)
+data/
+models/
+submissions/
