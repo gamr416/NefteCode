@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-NefteCode 2026 - Training with Learning Curves
+NefteCode 2026 - Improved Solution v2
+- One-hot encoding for component types
+- Normalized targets
+- Early stopping
+- Batch norm + dropout 0.25
+- Embedding 64
+- ReduceLROnPlateau
 """
 
 import pandas as pd
@@ -39,13 +45,30 @@ MASS_COL = "Массовая доля, %"
 SCENARIO_COL = "scenario_id"
 
 MAX_COMPONENTS = 50
-COMP_DIM = 23
-HIDDEN_DIM = 128
+HIDDEN_DIM = 64
 NUM_HEADS = 4
-M = 12
-DROPOUT = 0.1
+M = 8
+DROPOUT = 0.25
 GLOBAL_DIM = 4
 EPOCHS = 2000
+PATIENCE = 100
+NUM_PROPS = 20
+
+COMPONENT_TYPES = [
+    "base_oil",
+    "ao_phenol",
+    "ao_amine",
+    "ao_other",
+    "detergent",
+    "dispersant",
+    "zddp",
+    "molybdenum",
+    "thickener",
+    "depressor",
+    "antifoam",
+    "other",
+]
+TYPE_TO_IDX = {t: i for i, t in enumerate(COMPONENT_TYPES)}
 
 
 def create_properties_dict(props_df):
@@ -67,10 +90,8 @@ def create_properties_dict(props_df):
         batch = row[BATCH_COL]
         prop_name = row["Наименование показателя"]
         prop_value = row["Значение показателя"]
-
         if pd.isna(batch) or pd.isna(prop_value):
             continue
-
         key = (comp, batch)
         if key not in props_dict:
             props_dict[key] = {}
@@ -100,7 +121,34 @@ def safe_float(x):
         return np.nan
 
 
-def prepare_scenario_2d(
+def get_component_type(comp_name):
+    name_lower = comp_name.lower() if isinstance(comp_name, str) else ""
+    if "базовое" in name_lower or "масло" in name_lower:
+        return "base_oil"
+    elif "антиоксидант" in name_lower:
+        if "фенольн" in name_lower:
+            return "ao_phenol"
+        elif "аминн" in name_lower:
+            return "ao_amine"
+        return "ao_other"
+    elif "детергент" in name_lower or "моющее" in name_lower:
+        return "detergent"
+    elif "дисперсант" in name_lower:
+        return "dispersant"
+    elif "противоизнос" in name_lower or "zddp" in name_lower:
+        return "zddp"
+    elif "молибден" in name_lower or "modtc" in name_lower or "modtp" in name_lower:
+        return "molybdenum"
+    elif "загуститель" in name_lower or "полимер" in name_lower:
+        return "thickener"
+    elif "депрессор" in name_lower:
+        return "depressor"
+    elif "антипен" in name_lower:
+        return "antifoam"
+    return "other"
+
+
+def prepare_scenario_v2(
     scenario_df, scenario_id, props_dict, typical_dict, numeric_props, le
 ):
     scenario_data = scenario_df[scenario_df[SCENARIO_COL] == scenario_id]
@@ -116,6 +164,8 @@ def prepare_scenario_2d(
     )
 
     components = []
+    comp_types = []
+
     for _, row in scenario_data.iterrows():
         comp = row[COMP_COL]
         batch = row[BATCH_COL] if pd.notna(row[BATCH_COL]) else ""
@@ -123,6 +173,8 @@ def prepare_scenario_2d(
         log_mass = np.log(mass + 1e-6) if not np.isnan(mass) else 0
 
         comp_props = get_component_properties(comp, batch, props_dict, typical_dict)
+        comp_type = get_component_type(comp)
+        comp_types.append(comp_type)
 
         type_enc = le.transform([comp])[0] if comp in le.classes_ else -1
 
@@ -134,13 +186,27 @@ def prepare_scenario_2d(
             else:
                 prop_vals.append(0)
 
-        comp_vector = np.array([type_enc, mass, log_mass] + prop_vals[:20])
+        p_zn_ratio = prop_vals[4] / (prop_vals[2] + 1e-6) if prop_vals[2] > 0 else 0
+        p_zn_ratio = min(p_zn_ratio, 10)
+
+        one_hot = np.zeros(len(COMPONENT_TYPES))
+        if comp_type in TYPE_TO_IDX:
+            one_hot[TYPE_TO_IDX[comp_type]] = 1
+
+        comp_vector = np.concatenate(
+            [
+                [type_enc / 100, mass, log_mass],
+                prop_vals[:NUM_PROPS],
+                [p_zn_ratio],
+                one_hot,
+            ]
+        )
+
         components.append(comp_vector)
 
     components = np.array(components)
-
     if len(components) < MAX_COMPONENTS:
-        padding = np.zeros((MAX_COMPONENTS - len(components), 23))
+        padding = np.zeros((MAX_COMPONENTS - len(components), components.shape[1]))
         components = np.vstack([components, padding])
     elif len(components) > MAX_COMPONENTS:
         components = components[:MAX_COMPONENTS]
@@ -148,17 +214,30 @@ def prepare_scenario_2d(
     mask = np.zeros((MAX_COMPONENTS,))
     mask[: min(len(scenario_data), MAX_COMPONENTS)] = 1
 
-    return global_features, components, mask
+    comp_types_set = set(comp_types)
+    has_phenol_amine = int(
+        "ao_phenol" in comp_types_set and "ao_amine" in comp_types_set
+    )
+    has_amine_molybdenum = int(
+        "ao_amine" in comp_types_set and "molybdenum" in comp_types_set
+    )
+    has_zddp_phenol = int("zddp" in comp_types_set and "ao_phenol" in comp_types_set)
+
+    synergy_flags = np.array([has_phenol_amine, has_amine_molybdenum, has_zddp_phenol])
+
+    return global_features, components, mask, synergy_flags
 
 
 class DeepSetsEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, output_dim=64):
+    def __init__(self, input_dim, hidden_dim=64, output_dim=64):
         super().__init__()
         self.phi = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
         )
@@ -176,23 +255,23 @@ class DeepSetsEncoder(nn.Module):
 
 
 class DeepSetsModel(nn.Module):
-    def __init__(self, comp_dim, global_dim, hidden_dim=128, encode_dim=64):
+    def __init__(self, comp_dim, global_dim, hidden_dim=64, encode_dim=64):
         super().__init__()
         self.encoder = DeepSetsEncoder(comp_dim, hidden_dim, encode_dim)
         self.predictor = nn.Sequential(
-            nn.Linear(global_dim + encode_dim, hidden_dim),
+            nn.Linear(global_dim + encode_dim + 3, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(DROPOUT),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim // 2, 1),
         )
 
-    def forward(self, global_x, comp_x, mask):
+    def forward(self, global_x, comp_x, mask, synergy_flags):
         encoded = self.encoder(comp_x, mask)
-        combined = torch.cat([global_x, encoded], dim=-1)
-        return self.predictor(combined).squeeze()
+        combined = torch.cat([global_x, encoded, synergy_flags], dim=-1)
+        return self.predictor(combined).squeeze(-1)
 
 
 class MultiHeadAttention(nn.Module):
@@ -218,7 +297,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class ISAB(nn.Module):
-    def __init__(self, dim, num_heads=4, m=12):
+    def __init__(self, dim, num_heads=4, m=8):
         super().__init__()
         self.m = m
         self.I = nn.Parameter(torch.randn(1, m, dim))
@@ -240,7 +319,7 @@ class SetTransformer(nn.Module):
         self,
         comp_dim,
         global_dim,
-        hidden_dim=128,
+        hidden_dim=64,
         num_heads=4,
         num_isab=2,
         encode_dim=64,
@@ -253,27 +332,27 @@ class SetTransformer(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden_dim)
         self.predictor = nn.Sequential(
-            nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim),
+            nn.Linear(hidden_dim + hidden_dim // 2 + 3, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(DROPOUT),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim // 2, 1),
         )
 
-    def forward(self, global_x, comp_x, mask):
+    def forward(self, global_x, comp_x, mask, synergy_flags):
         comp_emb = self.comp_embedding(comp_x)
         for isab in self.isabs:
             comp_emb = isab(comp_emb)
         comp_emb = self.norm(comp_emb)
         pooled = (comp_emb * mask.unsqueeze(-1)).mean(dim=1)
         global_emb = self.global_embedding(global_x)
-        combined = torch.cat([global_emb, pooled], dim=-1)
-        return self.predictor(combined).squeeze()
+        combined = torch.cat([global_emb, pooled, synergy_flags], dim=-1)
+        return self.predictor(combined).squeeze(-1)
 
 
-def train_model_with_curve(
+def train_model_early_stop(
     model,
     X_global_train,
     X_comp_train,
@@ -283,7 +362,10 @@ def train_model_with_curve(
     X_comp_val,
     mask_val,
     y_val,
-    epochs=EPOCHS,
+    synergy_train,
+    synergy_val,
+    scaler_y,
+    epochs=2000,
     lr=0.001,
     batch_size=32,
     weight_decay=1e-4,
@@ -291,23 +373,27 @@ def train_model_with_curve(
 ):
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.MSELoss()
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    criterion = nn.MSELoss()
+
+    y_train_norm = scaler_y.transform(y_train.reshape(-1, 1)).flatten()
+    y_val_norm = scaler_y.transform(y_val.reshape(-1, 1)).flatten()
 
     X_global_t = torch.tensor(X_global_train, dtype=torch.float32)
     X_comp_t = torch.tensor(X_comp_train, dtype=torch.float32)
     mask_t = torch.tensor(mask_train, dtype=torch.float32)
-    y_t = torch.tensor(y_train, dtype=torch.float32)
-    dataset = TensorDataset(X_global_t, X_comp_t, mask_t, y_t)
+    synergy_t = torch.tensor(synergy_train, dtype=torch.float32)
+    y_t = torch.tensor(y_train_norm, dtype=torch.float32)
+    dataset = TensorDataset(X_global_t, X_comp_t, mask_t, synergy_t, y_t)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     X_global_val_t = torch.tensor(X_global_val, dtype=torch.float32).to(device)
     X_comp_val_t = torch.tensor(X_comp_val, dtype=torch.float32).to(device)
     mask_val_t = torch.tensor(mask_val, dtype=torch.float32).to(device)
-    y_val_t = torch.tensor(y_val, dtype=torch.float32).to(device)
+    synergy_val_t = torch.tensor(synergy_val, dtype=torch.float32).to(device)
+    y_val_norm_t = torch.tensor(y_val_norm, dtype=torch.float32).to(device)
 
-    train_losses = []
-    val_losses = []
+    train_losses, val_losses = [], []
     best_val_loss = float("inf")
     best_state = None
 
@@ -316,10 +402,16 @@ def train_model_with_curve(
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0
-        for xg, xc, m, yb in loader:
-            xg, xc, m, yb = xg.to(device), xc.to(device), m.to(device), yb.to(device)
+        for xg, xc, m, sf, yb in loader:
+            xg, xc, m, sf, yb = (
+                xg.to(device),
+                xc.to(device),
+                m.to(device),
+                sf.to(device),
+                yb.to(device),
+            )
             optimizer.zero_grad()
-            pred = model(xg, xc, m)
+            pred = model(xg, xc, m, sf)
             loss = criterion(pred, yb)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -330,19 +422,19 @@ def train_model_with_curve(
 
         model.eval()
         with torch.no_grad():
-            val_pred = model(X_global_val_t, X_comp_val_t, mask_val_t)
-            val_loss = criterion(val_pred, y_val_t).item()
+            val_pred = model(X_global_val_t, X_comp_val_t, mask_val_t, synergy_val_t)
+            val_loss = criterion(val_pred, y_val_norm_t).item()
         val_losses.append(val_loss)
+
+        scheduler.step()
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-        scheduler.step()
-
-        if (epoch + 1) % 200 == 0:
+        if (epoch + 1) % 500 == 0:
             print(
-                f"  Epoch {epoch + 1}: train_loss={train_losses[-1]:.4f}, val_loss={val_losses[-1]:.4f}"
+                f"  Epoch {epoch + 1}: train={train_losses[-1]:.4f}, val={val_losses[-1]:.4f}"
             )
 
     if best_state:
@@ -351,14 +443,16 @@ def train_model_with_curve(
     return model, train_losses, val_losses
 
 
-def predict_model(model, X_global, X_comp, mask):
+def predict_model(model, X_global, X_comp, mask, synergy_flags, scaler_y):
     model.eval()
     X_global_t = torch.tensor(X_global, dtype=torch.float32).to(device)
     X_comp_t = torch.tensor(X_comp, dtype=torch.float32).to(device)
     mask_t = torch.tensor(mask, dtype=torch.float32).to(device)
+    synergy_t = torch.tensor(synergy_flags, dtype=torch.float32).to(device)
 
     with torch.no_grad():
-        pred = model(X_global_t, X_comp_t, mask_t).cpu().numpy()
+        pred_norm = model(X_global_t, X_comp_t, mask_t, synergy_t).cpu().numpy()
+    pred = scaler_y.inverse_transform(pred_norm.reshape(-1, 1)).flatten()
     return pred
 
 
@@ -384,7 +478,7 @@ def main():
         if len(values) > 10:
             numeric_props.append(p)
 
-    PROPS_ORDER = numeric_props[:20]
+    PROPS_ORDER = numeric_props[:NUM_PROPS]
 
     all_component_types = set(train[COMP_COL].unique()) | set(test[COMP_COL].unique())
     le = LabelEncoder()
@@ -392,16 +486,17 @@ def main():
 
     print("=== Preparing data ===")
     train_scenarios = train[SCENARIO_COL].unique()
-    X_train_global, X_train_components, X_train_mask = [], [], []
+    X_train_global, X_train_components, X_train_mask, X_train_synergy = [], [], [], []
     y_visc, y_oxid, train_ids = [], [], []
 
     for sid in train_scenarios:
-        global_f, components, mask = prepare_scenario_2d(
+        global_f, components, mask, synergy = prepare_scenario_v2(
             train, sid, props_dict, typical_dict, PROPS_ORDER, le
         )
         X_train_global.append(global_f)
         X_train_components.append(components)
         X_train_mask.append(mask)
+        X_train_synergy.append(synergy)
 
         scenario_rows = train[train[SCENARIO_COL] == sid]
         y_visc.append(scenario_rows[TARGET_VISC].iloc[0])
@@ -411,24 +506,33 @@ def main():
     X_train_global = np.array(X_train_global)
     X_train_components = np.array(X_train_components)
     X_train_mask = np.array(X_train_mask)
+    X_train_synergy = np.array(X_train_synergy)
     y_visc = np.array(y_visc)
     y_oxid = np.array(y_oxid)
 
     test_scenarios = test[SCENARIO_COL].unique()
-    X_test_global, X_test_components, X_test_mask, test_ids = [], [], [], []
+    X_test_global, X_test_components, X_test_mask, X_test_synergy, test_ids = (
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
 
     for sid in test_scenarios:
-        global_f, components, mask = prepare_scenario_2d(
+        global_f, components, mask, synergy = prepare_scenario_v2(
             test, sid, props_dict, typical_dict, PROPS_ORDER, le
         )
         X_test_global.append(global_f)
         X_test_components.append(components)
         X_test_mask.append(mask)
+        X_test_synergy.append(synergy)
         test_ids.append(sid)
 
     X_test_global = np.array(X_test_global)
     X_test_components = np.array(X_test_components)
     X_test_mask = np.array(X_test_mask)
+    X_test_synergy = np.array(X_test_synergy)
 
     scaler_g = StandardScaler()
     X_train_global_scaled = scaler_g.fit_transform(np.nan_to_num(X_train_global, nan=0))
@@ -445,30 +549,38 @@ def main():
     X_train_components = X_train_comp_scaled.reshape(X_train_components.shape)
     X_test_components = X_test_comp_scaled.reshape(X_test_components.shape)
 
+    scaler_visc = StandardScaler()
+    scaler_oxid = StandardScaler()
+    scaler_visc.fit(y_visc.reshape(-1, 1))
+    scaler_oxid.fit(y_oxid.reshape(-1, 1))
+
+    comp_dim = X_train_components.shape[2]
+    print(f"Comp dim: {comp_dim}, Synergy flags: {X_train_synergy.shape[1]}")
+
     idx = np.arange(len(y_visc))
     idx_train, idx_val = train_test_split(idx, test_size=0.2, random_state=42)
 
     X_global_train = X_train_global_scaled[idx_train]
     X_comp_train = X_train_components[idx_train]
     mask_train = X_train_mask[idx_train]
+    synergy_train = X_train_synergy[idx_train]
     y_visc_train = y_visc[idx_train]
     y_oxid_train = y_oxid[idx_train]
 
     X_global_val = X_train_global_scaled[idx_val]
     X_comp_val = X_train_components[idx_val]
     mask_val = X_train_mask[idx_val]
+    synergy_val = X_train_synergy[idx_val]
     y_visc_val = y_visc[idx_val]
     y_oxid_val = y_oxid[idx_val]
 
     print(f"Train: {len(idx_train)} samples, Val: {len(idx_val)} samples")
 
-    all_train_losses = {"visc": [], "oxid": []}
-    all_val_losses = {"visc": [], "oxid": []}
+    all_curves = {}
 
     print("\n=== Training Deep Sets (Viscosity) ===")
-    ds_visc = DeepSetsModel(COMP_DIM, GLOBAL_DIM, HIDDEN_DIM, 64)
-    ds_visc, train_l, val_l = train_model_with_curve(
-        ds_visc,
+    ds_visc, tr_l, val_l = train_model_early_stop(
+        DeepSetsModel(comp_dim, GLOBAL_DIM, HIDDEN_DIM, 64),
         X_global_train,
         X_comp_train,
         mask_train,
@@ -477,16 +589,16 @@ def main():
         X_comp_val,
         mask_val,
         y_visc_val,
-        epochs=EPOCHS,
+        synergy_train,
+        synergy_val,
+        scaler_visc,
         model_name="DS_Viscosity",
     )
-    all_train_losses["visc"].append(train_l)
-    all_val_losses["visc"].append(val_l)
+    all_curves["ds_visc"] = (tr_l, val_l)
 
     print("\n=== Training Deep Sets (Oxidation) ===")
-    ds_oxid = DeepSetsModel(COMP_DIM, GLOBAL_DIM, HIDDEN_DIM, 64)
-    ds_oxid, train_l, val_l = train_model_with_curve(
-        ds_oxid,
+    ds_oxid, tr_l, val_l = train_model_early_stop(
+        DeepSetsModel(comp_dim, GLOBAL_DIM, HIDDEN_DIM, 64),
         X_global_train,
         X_comp_train,
         mask_train,
@@ -495,16 +607,16 @@ def main():
         X_comp_val,
         mask_val,
         y_oxid_val,
-        epochs=EPOCHS,
+        synergy_train,
+        synergy_val,
+        scaler_oxid,
         model_name="DS_Oxidation",
     )
-    all_train_losses["oxid"].append(train_l)
-    all_val_losses["oxid"].append(val_l)
+    all_curves["ds_oxid"] = (tr_l, val_l)
 
     print("\n=== Training Set Transformer (Viscosity) ===")
-    st_visc = SetTransformer(COMP_DIM, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64)
-    st_visc, train_l, val_l = train_model_with_curve(
-        st_visc,
+    st_visc, tr_l, val_l = train_model_early_stop(
+        SetTransformer(comp_dim, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64),
         X_global_train,
         X_comp_train,
         mask_train,
@@ -513,16 +625,17 @@ def main():
         X_comp_val,
         mask_val,
         y_visc_val,
-        epochs=EPOCHS,
+        synergy_train,
+        synergy_val,
+        scaler_visc,
+        lr=0.0005,
         model_name="ST_Viscosity",
     )
-    all_train_losses["visc"].append(train_l)
-    all_val_losses["visc"].append(val_l)
+    all_curves["st_visc"] = (tr_l, val_l)
 
     print("\n=== Training Set Transformer (Oxidation) ===")
-    st_oxid = SetTransformer(COMP_DIM, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64)
-    st_oxid, train_l, val_l = train_model_with_curve(
-        st_oxid,
+    st_oxid, tr_l, val_l = train_model_early_stop(
+        SetTransformer(comp_dim, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64),
         X_global_train,
         X_comp_train,
         mask_train,
@@ -531,55 +644,57 @@ def main():
         X_comp_val,
         mask_val,
         y_oxid_val,
-        epochs=EPOCHS,
+        synergy_train,
+        synergy_val,
+        scaler_oxid,
+        lr=0.0005,
         model_name="ST_Oxidation",
     )
-    all_train_losses["oxid"].append(train_l)
-    all_val_losses["oxid"].append(val_l)
+    all_curves["st_oxid"] = (tr_l, val_l)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    axes[0, 0].plot(all_train_losses["visc"][0], label="Train Loss (DS)", alpha=0.7)
-    axes[0, 0].plot(all_val_losses["visc"][0], label="Val Loss (DS)", alpha=0.7)
-    axes[0, 0].set_title("Deep Sets - Viscosity")
+    axes[0, 0].plot(all_curves["ds_visc"][0], label="Train", alpha=0.7)
+    axes[0, 0].plot(all_curves["ds_visc"][1], label="Val", alpha=0.7)
+    axes[0, 0].set_title("Deep Sets - Viscosity v2")
     axes[0, 0].set_xlabel("Epoch")
     axes[0, 0].set_ylabel("Loss")
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
 
-    axes[0, 1].plot(all_train_losses["oxid"][0], label="Train Loss (DS)", alpha=0.7)
-    axes[0, 1].plot(all_val_losses["oxid"][0], label="Val Loss (DS)", alpha=0.7)
-    axes[0, 1].set_title("Deep Sets - Oxidation")
+    axes[0, 1].plot(all_curves["ds_oxid"][0], label="Train", alpha=0.7)
+    axes[0, 1].plot(all_curves["ds_oxid"][1], label="Val", alpha=0.7)
+    axes[0, 1].set_title("Deep Sets - Oxidation v2")
     axes[0, 1].set_xlabel("Epoch")
     axes[0, 1].set_ylabel("Loss")
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
 
-    axes[1, 0].plot(all_train_losses["visc"][1], label="Train Loss (ST)", alpha=0.7)
-    axes[1, 0].plot(all_val_losses["visc"][1], label="Val Loss (ST)", alpha=0.7)
-    axes[1, 0].set_title("Set Transformer - Viscosity")
+    axes[1, 0].plot(all_curves["st_visc"][0], label="Train", alpha=0.7)
+    axes[1, 0].plot(all_curves["st_visc"][1], label="Val", alpha=0.7)
+    axes[1, 0].set_title("Set Transformer - Viscosity v2")
     axes[1, 0].set_xlabel("Epoch")
     axes[1, 0].set_ylabel("Loss")
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3)
 
-    axes[1, 1].plot(all_train_losses["oxid"][1], label="Train Loss (ST)", alpha=0.7)
-    axes[1, 1].plot(all_val_losses["oxid"][1], label="Val Loss (ST)", alpha=0.7)
-    axes[1, 1].set_title("Set Transformer - Oxidation")
+    axes[1, 1].plot(all_curves["st_oxid"][0], label="Train", alpha=0.7)
+    axes[1, 1].plot(all_curves["st_oxid"][1], label="Val", alpha=0.7)
+    axes[1, 1].set_title("Set Transformer - Oxidation v2")
     axes[1, 1].set_xlabel("Epoch")
     axes[1, 1].set_ylabel("Loss")
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("learning_curves.png", dpi=150)
-    print("\nSaved: learning_curves.png")
+    plt.savefig("learning_curves_v2.png", dpi=150)
+    print("\nSaved: learning_curves_v2.png")
 
-    print("\n=== Final Predictions (full training) ===")
+    print("\n=== Final Training ===")
 
-    ds_visc_full = DeepSetsModel(COMP_DIM, GLOBAL_DIM, HIDDEN_DIM, 64)
-    ds_visc_full, _, _ = train_model_with_curve(
-        ds_visc_full,
+    ds_visc = DeepSetsModel(comp_dim, GLOBAL_DIM, HIDDEN_DIM, 64)
+    ds_visc, _, _ = train_model_early_stop(
+        ds_visc,
         X_train_global_scaled,
         X_train_components,
         X_train_mask,
@@ -588,13 +703,16 @@ def main():
         X_train_components,
         X_train_mask,
         y_visc,
-        epochs=EPOCHS,
+        X_train_synergy,
+        X_train_synergy,
+        scaler_visc,
+        epochs=2000,
         model_name="DS_Viscosity_Full",
     )
 
-    ds_oxid_full = DeepSetsModel(COMP_DIM, GLOBAL_DIM, HIDDEN_DIM, 64)
-    ds_oxid_full, _, _ = train_model_with_curve(
-        ds_oxid_full,
+    ds_oxid = DeepSetsModel(comp_dim, GLOBAL_DIM, HIDDEN_DIM, 64)
+    ds_oxid, _, _ = train_model_early_stop(
+        ds_oxid,
         X_train_global_scaled,
         X_train_components,
         X_train_mask,
@@ -603,13 +721,16 @@ def main():
         X_train_components,
         X_train_mask,
         y_oxid,
-        epochs=EPOCHS,
+        X_train_synergy,
+        X_train_synergy,
+        scaler_oxid,
+        epochs=2000,
         model_name="DS_Oxidation_Full",
     )
 
-    st_visc_full = SetTransformer(COMP_DIM, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64)
-    st_visc_full, _, _ = train_model_with_curve(
-        st_visc_full,
+    st_visc = SetTransformer(comp_dim, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64)
+    st_visc, _, _ = train_model_early_stop(
+        st_visc,
         X_train_global_scaled,
         X_train_components,
         X_train_mask,
@@ -618,13 +739,17 @@ def main():
         X_train_components,
         X_train_mask,
         y_visc,
-        epochs=EPOCHS,
+        X_train_synergy,
+        X_train_synergy,
+        scaler_visc,
+        lr=0.0005,
+        epochs=2000,
         model_name="ST_Viscosity_Full",
     )
 
-    st_oxid_full = SetTransformer(COMP_DIM, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64)
-    st_oxid_full, _, _ = train_model_with_curve(
-        st_oxid_full,
+    st_oxid = SetTransformer(comp_dim, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64)
+    st_oxid, _, _ = train_model_early_stop(
+        st_oxid,
         X_train_global_scaled,
         X_train_components,
         X_train_mask,
@@ -633,36 +758,58 @@ def main():
         X_train_components,
         X_train_mask,
         y_oxid,
-        epochs=EPOCHS,
+        X_train_synergy,
+        X_train_synergy,
+        scaler_oxid,
+        lr=0.0005,
+        epochs=2000,
         model_name="ST_Oxidation_Full",
     )
 
     pred_ds_visc = predict_model(
-        ds_visc_full, X_test_global_scaled, X_test_components, X_test_mask
+        ds_visc,
+        X_test_global_scaled,
+        X_test_components,
+        X_test_mask,
+        X_test_synergy,
+        scaler_visc,
     )
     pred_st_visc = predict_model(
-        st_visc_full, X_test_global_scaled, X_test_components, X_test_mask
+        st_visc,
+        X_test_global_scaled,
+        X_test_components,
+        X_test_mask,
+        X_test_synergy,
+        scaler_visc,
     )
     pred_ds_oxid = predict_model(
-        ds_oxid_full, X_test_global_scaled, X_test_components, X_test_mask
+        ds_oxid,
+        X_test_global_scaled,
+        X_test_components,
+        X_test_mask,
+        X_test_synergy,
+        scaler_oxid,
     )
     pred_st_oxid = predict_model(
-        st_oxid_full, X_test_global_scaled, X_test_components, X_test_mask
+        st_oxid,
+        X_test_global_scaled,
+        X_test_components,
+        X_test_mask,
+        X_test_synergy,
+        scaler_oxid,
     )
 
     pred_visc = 0.6 * pred_st_visc + 0.4 * pred_ds_visc
     pred_oxid = (pred_ds_oxid + pred_st_oxid) / 2
 
-    print(f"\nViscosity: mean={pred_visc.mean():.2f}, std={pred_visc.std():.2f}")
+    print(f"Viscosity: mean={pred_visc.mean():.2f}, std={pred_visc.std():.2f}")
     print(f"Oxidation: mean={pred_oxid.mean():.2f}, std={pred_oxid.std():.2f}")
 
     submission = pd.DataFrame(
         {"scenario_id": test_ids, TARGET_VISC: pred_visc, TARGET_OXID: pred_oxid}
     )
-
     submission.to_csv("predictions.csv", index=False, encoding="utf-8")
     print("\nSaved: predictions.csv")
-    print(submission.head())
 
 
 if __name__ == "__main__":
