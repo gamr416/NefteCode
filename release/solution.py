@@ -3,11 +3,12 @@
 NefteCode 2026 - Improved Solution v2
 - One-hot encoding for component types
 - Normalized targets
-- Early stopping
-- Batch norm + dropout 0.25
-- Embedding 64
-- ReduceLROnPlateau
+- Early stopping on validation (patience)
+- LayerNorm + dropout 0.25
+- Deep Sets + Set Transformer ensemble
 """
+
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -22,14 +23,30 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+DATA_PATH = REPO_ROOT / "data"
+
+RNG_SEED = 42
+
+
+def set_seed(seed: int = RNG_SEED) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_seed(RNG_SEED)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
-DATA_PATH = "data/"
-
-train = pd.read_csv(f"{DATA_PATH}/daimler_mixtures_train.csv")
-test = pd.read_csv(f"{DATA_PATH}/daimler_mixtures_test.csv")
-props = pd.read_csv(f"{DATA_PATH}/daimler_component_properties.csv")
+train = pd.read_csv(DATA_PATH / "daimler_mixtures_train.csv")
+test = pd.read_csv(DATA_PATH / "daimler_mixtures_test.csv")
+props = pd.read_csv(DATA_PATH / "daimler_component_properties.csv")
 
 TARGET_VISC = (
     "Delta Kin. Viscosity KV100 - relative | - Daimler Oxidation Test (DOT), %"
@@ -50,7 +67,7 @@ NUM_HEADS = 4
 M = 8
 DROPOUT = 0.25
 GLOBAL_DIM = 4
-EPOCHS = 2000
+EPOCHS = 1750
 PATIENCE = 100
 NUM_PROPS = 20
 
@@ -101,15 +118,20 @@ def create_properties_dict(props_df):
 
 
 def get_component_properties(comp, batch, props_dict, typical_dict):
+    """
+    Measured properties for (comp, batch) override typical values per task rules.
+    Never substitute properties from another batch of the same component.
+    """
+    typical_vals = dict(typical_dict.get(comp, {}))
+    if pd.isna(batch) or batch == "":
+        return typical_vals
     key = (comp, batch)
-    if key in props_dict:
-        return props_dict[key]
-    for k, v in props_dict.items():
-        if k[0] == comp:
-            return v
-    if comp in typical_dict:
-        return typical_dict[comp]
-    return {}
+    if key not in props_dict:
+        return typical_vals
+    measured = props_dict[key]
+    merged = dict(typical_vals)
+    merged.update(measured)
+    return merged
 
 
 def safe_float(x):
@@ -119,6 +141,29 @@ def safe_float(x):
         return float(str(x).replace(",", "."))
     except Exception:
         return np.nan
+
+
+def compute_zn_p_ratio(prop_vals, prop_names):
+    """Zn/P style ratio from named properties; avoids magic indices into sorted props."""
+    zn_idx = phos_idx = None
+    for i, name in enumerate(prop_names):
+        nl = str(name).lower()
+        if zn_idx is None and "цинк" in nl:
+            zn_idx = i
+        if phos_idx is None and "фосфор" in nl:
+            phos_idx = i
+    if (
+        zn_idx is None
+        or phos_idx is None
+        or zn_idx >= len(prop_vals)
+        or phos_idx >= len(prop_vals)
+    ):
+        return 0.0
+    p = float(prop_vals[phos_idx])
+    zn = float(prop_vals[zn_idx])
+    if p <= 0:
+        return 0.0
+    return min(zn / (p + 1e-6), 10.0)
 
 
 def get_component_type(comp_name):
@@ -186,8 +231,7 @@ def prepare_scenario_v2(
             else:
                 prop_vals.append(0)
 
-        p_zn_ratio = prop_vals[4] / (prop_vals[2] + 1e-6) if prop_vals[2] > 0 else 0
-        p_zn_ratio = min(p_zn_ratio, 10)
+        p_zn_ratio = compute_zn_p_ratio(prop_vals, numeric_props[:NUM_PROPS])
 
         one_hot = np.zeros(len(COMPONENT_TYPES))
         if comp_type in TYPE_TO_IDX:
@@ -365,11 +409,12 @@ def train_model_early_stop(
     synergy_train,
     synergy_val,
     scaler_y,
-    epochs=2000,
+    epochs=EPOCHS,
     lr=0.001,
     batch_size=32,
     weight_decay=1e-4,
     model_name="model",
+    patience=None,
 ):
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -385,7 +430,10 @@ def train_model_early_stop(
     synergy_t = torch.tensor(synergy_train, dtype=torch.float32)
     y_t = torch.tensor(y_train_norm, dtype=torch.float32)
     dataset = TensorDataset(X_global_t, X_comp_t, mask_t, synergy_t, y_t)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    gen = torch.Generator().manual_seed(RNG_SEED)
+    loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, generator=gen
+    )
 
     X_global_val_t = torch.tensor(X_global_val, dtype=torch.float32).to(device)
     X_comp_val_t = torch.tensor(X_comp_val, dtype=torch.float32).to(device)
@@ -396,8 +444,9 @@ def train_model_early_stop(
     train_losses, val_losses = [], []
     best_val_loss = float("inf")
     best_state = None
+    epochs_no_improve = 0
 
-    print(f"Training {model_name} for {epochs} epochs...")
+    print(f"Training {model_name} for up to {epochs} epochs...")
 
     for epoch in range(epochs):
         model.train()
@@ -431,6 +480,15 @@ def train_model_early_stop(
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if patience is not None and epochs_no_improve >= patience:
+            print(
+                f"  Early stop at epoch {epoch + 1} (no val improvement for {patience} epochs)"
+            )
+            break
 
         if (epoch + 1) % 500 == 0:
             print(
@@ -593,6 +651,7 @@ def main():
         synergy_val,
         scaler_visc,
         model_name="DS_Viscosity",
+        patience=PATIENCE,
     )
     all_curves["ds_visc"] = (tr_l, val_l)
 
@@ -611,6 +670,7 @@ def main():
         synergy_val,
         scaler_oxid,
         model_name="DS_Oxidation",
+        patience=PATIENCE,
     )
     all_curves["ds_oxid"] = (tr_l, val_l)
 
@@ -630,6 +690,7 @@ def main():
         scaler_visc,
         lr=0.0005,
         model_name="ST_Viscosity",
+        patience=PATIENCE,
     )
     all_curves["st_visc"] = (tr_l, val_l)
 
@@ -649,51 +710,14 @@ def main():
         scaler_oxid,
         lr=0.0005,
         model_name="ST_Oxidation",
+        patience=PATIENCE,
     )
     all_curves["st_oxid"] = (tr_l, val_l)
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    axes[0, 0].plot(all_curves["ds_visc"][0], label="Train", alpha=0.7)
-    axes[0, 0].plot(all_curves["ds_visc"][1], label="Val", alpha=0.7)
-    axes[0, 0].set_title("Deep Sets - Viscosity v2")
-    axes[0, 0].set_xlabel("Epoch")
-    axes[0, 0].set_ylabel("Loss")
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-
-    axes[0, 1].plot(all_curves["ds_oxid"][0], label="Train", alpha=0.7)
-    axes[0, 1].plot(all_curves["ds_oxid"][1], label="Val", alpha=0.7)
-    axes[0, 1].set_title("Deep Sets - Oxidation v2")
-    axes[0, 1].set_xlabel("Epoch")
-    axes[0, 1].set_ylabel("Loss")
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
-
-    axes[1, 0].plot(all_curves["st_visc"][0], label="Train", alpha=0.7)
-    axes[1, 0].plot(all_curves["st_visc"][1], label="Val", alpha=0.7)
-    axes[1, 0].set_title("Set Transformer - Viscosity v2")
-    axes[1, 0].set_xlabel("Epoch")
-    axes[1, 0].set_ylabel("Loss")
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-
-    axes[1, 1].plot(all_curves["st_oxid"][0], label="Train", alpha=0.7)
-    axes[1, 1].plot(all_curves["st_oxid"][1], label="Val", alpha=0.7)
-    axes[1, 1].set_title("Set Transformer - Oxidation v2")
-    axes[1, 1].set_xlabel("Epoch")
-    axes[1, 1].set_ylabel("Loss")
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig("learning_curves_v2.png", dpi=150)
-    print("\nSaved: learning_curves_v2.png")
 
     print("\n=== Final Training ===")
 
     ds_visc = DeepSetsModel(comp_dim, GLOBAL_DIM, HIDDEN_DIM, 64)
-    ds_visc, _, _ = train_model_early_stop(
+    ds_visc, tr_f, val_f = train_model_early_stop(
         ds_visc,
         X_train_global_scaled,
         X_train_components,
@@ -706,12 +730,14 @@ def main():
         X_train_synergy,
         X_train_synergy,
         scaler_visc,
-        epochs=2000,
+        epochs=EPOCHS,
         model_name="DS_Viscosity_Full",
+        patience=None,
     )
+    full_curves = {"ds_visc": (tr_f, val_f)}
 
     ds_oxid = DeepSetsModel(comp_dim, GLOBAL_DIM, HIDDEN_DIM, 64)
-    ds_oxid, _, _ = train_model_early_stop(
+    ds_oxid, tr_f, val_f = train_model_early_stop(
         ds_oxid,
         X_train_global_scaled,
         X_train_components,
@@ -724,12 +750,14 @@ def main():
         X_train_synergy,
         X_train_synergy,
         scaler_oxid,
-        epochs=2000,
+        epochs=EPOCHS,
         model_name="DS_Oxidation_Full",
+        patience=None,
     )
+    full_curves["ds_oxid"] = (tr_f, val_f)
 
     st_visc = SetTransformer(comp_dim, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64)
-    st_visc, _, _ = train_model_early_stop(
+    st_visc, tr_f, val_f = train_model_early_stop(
         st_visc,
         X_train_global_scaled,
         X_train_components,
@@ -743,12 +771,14 @@ def main():
         X_train_synergy,
         scaler_visc,
         lr=0.0005,
-        epochs=2000,
+        epochs=EPOCHS,
         model_name="ST_Viscosity_Full",
+        patience=None,
     )
+    full_curves["st_visc"] = (tr_f, val_f)
 
     st_oxid = SetTransformer(comp_dim, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, 2, 64)
-    st_oxid, _, _ = train_model_early_stop(
+    st_oxid, tr_f, val_f = train_model_early_stop(
         st_oxid,
         X_train_global_scaled,
         X_train_components,
@@ -762,9 +792,53 @@ def main():
         X_train_synergy,
         scaler_oxid,
         lr=0.0005,
-        epochs=2000,
+        epochs=EPOCHS,
         model_name="ST_Oxidation_Full",
+        patience=None,
     )
+    full_curves["st_oxid"] = (tr_f, val_f)
+
+    curve_keys = ["ds_visc", "ds_oxid", "st_visc", "st_oxid"]
+    titles_split = [
+        "Deep Sets — Viscosity (train/val split, early stop)",
+        "Deep Sets — Oxidation (train/val split, early stop)",
+        "Set Transformer — Viscosity (train/val split, early stop)",
+        "Set Transformer — Oxidation (train/val split, early stop)",
+    ]
+    titles_full = [
+        f"Deep Sets — Viscosity (full train, {EPOCHS} epochs)",
+        f"Deep Sets — Oxidation (full train, {EPOCHS} epochs)",
+        f"Set Transformer — Viscosity (full train, {EPOCHS} epochs)",
+        f"Set Transformer — Oxidation (full train, {EPOCHS} epochs)",
+    ]
+
+    fig, axes = plt.subplots(4, 2, figsize=(14, 20))
+    for i, key in enumerate(curve_keys):
+        tr_s, va_s = all_curves[key]
+        ep_s = np.arange(1, len(tr_s) + 1)
+        axes[i, 0].plot(ep_s, tr_s, label="Train", alpha=0.75)
+        axes[i, 0].plot(ep_s, va_s, label="Val", alpha=0.75)
+        axes[i, 0].set_title(titles_split[i])
+        axes[i, 0].set_xlabel("Epoch")
+        axes[i, 0].set_ylabel("Loss")
+        axes[i, 0].legend()
+        axes[i, 0].grid(True, alpha=0.3)
+
+        tr_f, va_f = full_curves[key]
+        ep_f = np.arange(1, len(tr_f) + 1)
+        axes[i, 1].plot(ep_f, tr_f, label="Train", alpha=0.75)
+        axes[i, 1].plot(ep_f, va_f, label="Val", alpha=0.75)
+        axes[i, 1].set_title(titles_full[i])
+        axes[i, 1].set_xlabel("Epoch")
+        axes[i, 1].set_ylabel("Loss")
+        axes[i, 1].legend()
+        axes[i, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    curves_path = SCRIPT_DIR / "learning_curves_v2.png"
+    plt.savefig(curves_path, dpi=150)
+    plt.close()
+    print(f"\nSaved: {curves_path}")
 
     pred_ds_visc = predict_model(
         ds_visc,
@@ -808,8 +882,9 @@ def main():
     submission = pd.DataFrame(
         {"scenario_id": test_ids, TARGET_VISC: pred_visc, TARGET_OXID: pred_oxid}
     )
-    submission.to_csv("predictions.csv", index=False, encoding="utf-8")
-    print("\nSaved: predictions.csv")
+    pred_path = SCRIPT_DIR / "predictions.csv"
+    submission.to_csv(pred_path, index=False, encoding="utf-8")
+    print(f"\nSaved: {pred_path}")
 
 
 if __name__ == "__main__":

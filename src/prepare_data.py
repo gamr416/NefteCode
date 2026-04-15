@@ -4,9 +4,12 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 import warnings
 import pickle
 import os
+from pathlib import Path
+
 warnings.filterwarnings('ignore')
 
-DATA_PATH = 'data/'
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA_PATH = str(REPO_ROOT / 'data') + os.sep
 
 # Load data
 train = pd.read_csv(os.path.join(DATA_PATH, 'daimler_mixtures_train.csv'))
@@ -63,15 +66,16 @@ print(f"Properties: measured={len(props_dict)}, typical={len(typical_dict)}")
 
 # Get component properties
 def get_component_properties(comp, batch, props_dict, typical_dict):
+    typical_vals = dict(typical_dict.get(comp, {}))
+    if pd.isna(batch) or batch == '':
+        return typical_vals
     key = (comp, batch)
-    if key in props_dict:
-        return props_dict[key]
-    for k, v in props_dict.items():
-        if k[0] == comp:
-            return v
-    if comp in typical_dict:
-        return typical_dict[comp]
-    return {}
+    if key not in props_dict:
+        return typical_vals
+    measured = props_dict[key]
+    merged = dict(typical_vals)
+    merged.update(measured)
+    return merged
 
 # Collect numeric properties
 all_props = set()
