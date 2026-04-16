@@ -6,16 +6,20 @@
 
 2. **Свойства компонентов**: словарь измеренных пар `(компонент, партия)` и словарь типичных значений по компоненту. Для строки рецептуры: если есть измерения для пары `(comp, batch)`, они **сливаются поверх** типичных значений; при отсутствии пары используются только типичные. Подстановка свойств с **другой партии** того же компонента не выполняется.
 
-3. **Признаки сценария**: глобальные условия DOT (4 числа); на компонент — тип (LabelEncoder + one-hot по эвристике имени), масса, log-масса, до 20 числовых свойств, отношение Zn/P по именам показателей (подстроки «цинк» / «фосфор»), флаги синергий. Множество компонентов дополняется нулями до `MAX_COMPONENTS=50`.
+3. **Признаки сценария**: глобальные условия DOT (4 числа); на компонент — **масса, log(масса)**, до `NUM_PROPS` числовых свойств, **Zn/P только для типа zddp** (иначе 0), **one-hot типа** (12 классов по эвристике имени). **Без** ordinal `LabelEncoder` по имени компонента. Множество компонентов дополняется нулями до `MAX_COMPONENTS=50`.
 
-4. **Модели**: две головы на таргет — `DeepSetsModel` и `SetTransformer` (отдельно для вязкости и окисления). Обучение: фаза с hold-out валидацией (early stopping по `PATIENCE`), затем дообучение на полном train без early stopping. Ансамбль: вязкость `0.6 * ST + 0.4 * DS`, окисление среднее ST и DS.
+4. **Нормализация**: `StandardScaler` на глобальные 4 признака; на компонентный тензор — **только первые `N_CONT_PER_COMP` непрерывных** столбцов (масса, log, свойства, p_zn); **one-hot не масштабируются**. Синергийные **7** бинарных флагов на сценарий не входят в `scaler_c`.
 
-5. **Выход**: `release/predictions.csv`, график `release/learning_curves_v2.png` (сетка 4×2: слева фаза train/val с early stopping, справа полное обучение на всех `EPOCHS` эпохах с осями «Epoch» 1…N).
+5. **Модели**: `DeepSetsModel` (encoder: phi + **mean и max** по маске) и `SetTransformer` (ISAB-блоки + **PMA** — один learnable seed, `MultiheadAttention` к компонентам с `key_padding_mask`). Вязкость: **`RobustScaler`** + **`SmoothL1Loss`**; окисление: **`StandardScaler`** + MSE.
+
+6. **Обучение**: фаза графиков learning curve — **тот же `KFold`, что и финал**: train/val = **fold0** (`fold0_tr` / `fold0_va`); таргет-скейлеры (`RobustScaler` вязкость, `StandardScaler` окисление) для этой фазы **обучаются только на train fold0**. **Early stopping** (`PATIENCE`) только здесь. **Финал (K-fold)**: на каждом фолде таргет-скейлеры **заново fit только на train этого фолда**; обучение **все `EPOCHS` эпох** без early stop на фолде; val-фолд для **лучшего чекпоинта по прокси лидерборда — средний `|pred_z − y_z|` (MAE в z)** на валидации, совпадающий с `scaler_y` фолда. LR: линейный warmup (`WARMUP_FRAC`) + косинус до `eta_min`. `BATCH_SIZE` 32 на GPU, 16 на CPU. Предсказания на тесте **усредняются по фолдам**. Итог: вязкость `0.6 * mean(ST) + 0.4 * mean(DS)`, окисление — среднее ST и DS; окисление **clip ≥ 0**.
+
+7. **Выход**: `release/predictions.csv`, `release/learning_curves_v2.png` (сетка 4×2: слева фаза с отложенной выборкой, справа кривые первого фолда K-fold). История лоссов (train/val по эпохам) и краткая сводка — в `release/training_loss_metrics.json` после полного прогона `main()`.
 
 ## Воспроизводимость
 
-Фиксированный `RNG_SEED=42` для NumPy и PyTorch; детерминированный CUDNN; `DataLoader` с `generator` для shuffle.
+`set_seed`, детерминированный CUDNN, генератор `DataLoader`; K-fold с фиксированным `random_state`.
 
 ## Сабмит
 
-Каталог `release/`: `solution.py`, `inference.ipynb` (запуск `solution.py` через `sys.executable` из каталога release), `requirements.txt` (включая `matplotlib`), сгенерированные `predictions.csv` и `solution.zip` для загрузки (в архиве те же четыре файла).
+Каталог `release/`: `solution.py`, `inference.ipynb`, `requirements.txt`, `predictions.csv`, `solution.zip`.
