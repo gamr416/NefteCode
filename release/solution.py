@@ -3,9 +3,12 @@
 NefteCode 2026 — решение с упором на качество (вязкость + окисление).
 - Тип компонента: только one-hot (без ordinal LabelEncoder).
 - StandardScaler только на непрерывные признаки компонента; one-hot не масштабируются.
-- Deep Sets (mean+max) + Set Transformer (ISAB + PMA pool); синергии 7 бинарных флагов.
+- Deep Sets (mean+max) + Set Transformer (ISAB + PMA pool); синергии 7 **непрерывных** (произведения долей типов), отдельный StandardScaler.
 - Вязкость: RobustScaler + SmoothL1; окисление: StandardScaler + MSE; Zn/P только для ZDDP.
-- K-fold: скейлеры таргетов только на train фолда; лучший чекпоинт по прокси метрики (MAE в z, как лидерборд); warmup+cosine LR; фаза графиков = fold0 того же KFold.
+- K-fold: скейлеры таргетов только на train фолда; лучший чекпоинт по MAE в z; warmup+cosine; фаза графиков = fold0 того же KFold.
+- Отбор числовых свойств: не алфавит, а корреляция масс.-средних по рецепту с таргетами (вес вязкости VISC_PROP_RANK_WEIGHT).
+- Глобальные признаки: DOT + доли по типам + химия: истощение AO (TBN/ZDDP vs T,t), загуститель, каталитический след, N в дисперсантах, disp×det.
+- Вязкость: вес ST в ансамбле DS+ST подбирается по OOF (минимум MAE на train).
 """
 
 from pathlib import Path
@@ -42,6 +45,20 @@ def set_seed(seed: int = RNG_SEED) -> None:
 
 
 set_seed(RNG_SEED)
+
+
+def optimize_visc_st_blend_weight(oof_ds, oof_st, y_true):
+    """Подбор веса ST в смеси w*ST + (1-w)*DS по минимуму MAE на OOF (полный train покрыт фолдами)."""
+    y = np.asarray(y_true, dtype=float)
+    best_w = 0.6
+    best_mae = float("inf")
+    for w in np.linspace(0.0, 1.0, 401):
+        pred = w * oof_st + (1.0 - w) * oof_ds
+        mae = float(np.mean(np.abs(pred - y)))
+        if mae < best_mae - 1e-12:
+            best_mae = mae
+            best_w = float(w)
+    return best_w, best_mae
 
 
 def _loss_curves_payload(train_losses, val_losses):
@@ -85,13 +102,27 @@ NUM_HEADS = 4
 NUM_ISAB = 3
 M = 12
 DROPOUT = 0.25
-GLOBAL_DIM = 4
-EPOCHS = 4000
+# Первые 4 — условия DOT; далее доли массы по типам; затем химические агрегаты сценария (см. prepare_scenario_v2).
+RECIPE_FRAC_DIM = 4
+CHEM_EXTRA_DIM = 6
+GLOBAL_DIM = 4 + RECIPE_FRAC_DIM + CHEM_EXTRA_DIM
+# Отбор свойств: выше — сильнее влияние на ранжирование в пользу вязкости (слабое место на лидерборде).
+VISC_PROP_RANK_WEIGHT = 0.72
+# Phase1 (fold0 + PATIENCE): только верхняя граница эпох до early stop.
+EPOCHS_PHASE1_MAX = 2500
+# K-fold: вязкость — длинный прогон; окисление быстро упирается в плато — короче + patience по val MAE(z).
+EPOCHS_KFOLD_VISC = 5000
+EPOCHS_KFOLD_OXID = 1400
+PATIENCE_KFOLD_OXID = 120
+# Игнорировать микроулучшения val MAE(z) при выборе чекпоинта (шум малого val).
+CHECKPOINT_MIN_DELTA_VISC = 0.0
+CHECKPOINT_MIN_DELTA_OXID = 6e-4
+LR_ST_VISC = 2.8e-4
 PATIENCE = 180
 NUM_PROPS = 24
 BATCH_SIZE = 32 if torch.cuda.is_available() else 16
 WARMUP_FRAC = 0.05
-# K-fold: val только для выбора лучшего чекпоинта (без early stop — мало точек, лосс шумный)
+# K-fold: вязкость — val только для чекпоинта без early stop; окисление — early stop при плато val MAE(z).
 K_FOLD = 5
 K_FOLD_SEED = 42
 
@@ -114,6 +145,48 @@ SYNERGY_DIM = 7
 N_CAT = len(COMPONENT_TYPES)
 # [mass, log_mass] + NUM_PROPS + [p_zn_ratio] — только это под StandardScaler
 N_CONT_PER_COMP = 2 + NUM_PROPS + 1
+
+
+def build_chem_prop_groups(unique_prop_names):
+    """
+    Подбор имён показателей из daimler_component_properties (подстроки, без таргета).
+    Cu/Fe в датасете не найдены — каталитический след через Ca, S, B, металл Ca/Mg, P, Zn.
+    """
+    names = sorted({str(x) for x in unique_prop_names if pd.notna(x)})
+
+    def filt(pred):
+        return [n for n in names if pred(n.lower())]
+
+    return {
+        "tbn": filt(lambda l: "щелочное число" in l),
+        "phos": filt(lambda l: "фосфор" in l and "массов" in l),
+        "zn": filt(lambda l: "цинк" in l and "массов" in l),
+        "ca": filt(lambda l: "кальци" in l and "массов" in l),
+        "s": filt(
+            lambda l: ("сер" in l)
+            and ("массов" in l or "содержание серы" in l or "мг/кг" in l)
+        ),
+        "b": filt(lambda l: "бор" in l and "например" not in l),
+        "metal": filt(lambda l: "металла" in l or "ca/mg" in l),
+        "nitro_disp": filt(
+            lambda l: ("азот" in l)
+            and ("активн" not in l)
+            and (
+                "общ" in l
+                or "d3228" in l.replace(" ", "")
+                or l.startswith("содержание азота")
+            )
+        ),
+    }
+
+
+chem_prop_groups = build_chem_prop_groups(
+    props["Наименование показателя"].dropna().astype(str).unique()
+)
+print("=== Chem property groups (substring match) ===")
+for ck, cv in chem_prop_groups.items():
+    ex = f" | e.g. {cv[0][:55]}…" if cv else ""
+    print(f"  {ck}: n={len(cv)}{ex}")
 
 
 def create_properties_dict(props_df):
@@ -194,6 +267,77 @@ def compute_zn_p_ratio(prop_vals, prop_names):
     return min(zn / (p + 1e-6), 10.0)
 
 
+def mass_weighted_prop_mean(
+    scenario_df, scenario_id, prop_name, props_dict, typical_dict
+):
+    """Среднее значение показателя по рецепту с весами массовых долей."""
+    scenario_data = scenario_df[scenario_df[SCENARIO_COL] == scenario_id]
+    num = 0.0
+    den = 0.0
+    for _, row in scenario_data.iterrows():
+        m = safe_float(row[MASS_COL])
+        if np.isnan(m) or m <= 0:
+            continue
+        comp = row[COMP_COL]
+        batch = row[BATCH_COL] if pd.notna(row[BATCH_COL]) else ""
+        cp = get_component_properties(comp, batch, props_dict, typical_dict)
+        if prop_name not in cp:
+            continue
+        pv = safe_float(cp[prop_name])
+        if np.isnan(pv):
+            continue
+        num += m * pv
+        den += m
+    return float(num / den) if den > 1e-9 else 0.0
+
+
+def select_numeric_props_ranked(
+    scenario_df,
+    scenario_ids,
+    props_dict,
+    typical_dict,
+    candidate_props,
+    y_visc,
+    y_oxid,
+    n_select,
+    visc_weight=VISC_PROP_RANK_WEIGHT,
+):
+    """
+    Ранжирование свойств по |corr| с таргетами на масс.-взвешенных агрегатах по train-сценариям.
+    visc_weight > 0.5 смещает отбор в пользу вязкости.
+    """
+    yv = np.asarray(y_visc, dtype=float)
+    yo = np.asarray(y_oxid, dtype=float)
+    scored = []
+    for prop in candidate_props:
+        col = np.array(
+            [
+                mass_weighted_prop_mean(
+                    scenario_df, sid, prop, props_dict, typical_dict
+                )
+                for sid in scenario_ids
+            ],
+            dtype=float,
+        )
+        if np.std(col) < 1e-12:
+            continue
+        rv = np.corrcoef(col, yv)[0, 1]
+        ro = np.corrcoef(col, yo)[0, 1]
+        rv = 0.0 if np.isnan(rv) else abs(float(rv))
+        ro = 0.0 if np.isnan(ro) else abs(float(ro))
+        comb = visc_weight * rv + (1.0 - visc_weight) * ro
+        scored.append((comb, rv, ro, prop))
+    scored.sort(key=lambda x: -x[0])
+    selected = [t[3] for t in scored[:n_select]]
+    seen = set(selected)
+    if len(selected) < n_select:
+        for p in sorted(candidate_props):
+            if p not in seen and len(selected) < n_select:
+                selected.append(p)
+                seen.add(p)
+    return selected, scored
+
+
 def get_component_type(comp_name):
     name_lower = comp_name.lower() if isinstance(comp_name, str) else ""
     if "базовое" in name_lower or "масло" in name_lower:
@@ -221,9 +365,132 @@ def get_component_type(comp_name):
     return "other"
 
 
-def prepare_scenario_v2(scenario_df, scenario_id, props_dict, typical_dict, numeric_props):
+def _mass_weighted_max_prop_for_types(
+    scenario_data,
+    props_dict,
+    typical_dict,
+    chem_prop_groups,
+    group_key,
+    type_set,
+):
+    names = chem_prop_groups.get(group_key) or []
+    if not names:
+        return 0.0
+    num, den = 0.0, 0.0
+    for _, row in scenario_data.iterrows():
+        if get_component_type(row[COMP_COL]) not in type_set:
+            continue
+        m = safe_float(row[MASS_COL])
+        if np.isnan(m) or m <= 0:
+            continue
+        batch = row[BATCH_COL] if pd.notna(row[BATCH_COL]) else ""
+        cp = get_component_properties(row[COMP_COL], batch, props_dict, typical_dict)
+        best = 0.0
+        for nm in names:
+            if nm in cp:
+                v = safe_float(cp[nm])
+                if not np.isnan(v):
+                    best = max(best, v)
+        num += m * best
+        den += m
+    return float(num / den) if den > 1e-9 else 0.0
+
+
+def _catalytic_element_sum(cp, chem_prop_groups):
+    s = 0.0
+    for key in ("ca", "s", "b", "metal", "phos", "zn"):
+        mx = 0.0
+        for nm in chem_prop_groups.get(key, []):
+            if nm in cp:
+                v = safe_float(cp[nm])
+                if not np.isnan(v):
+                    mx = max(mx, v)
+        s += mx
+    return s
+
+
+def _catalytic_trace_scenario(scenario_data, props_dict, typical_dict, chem_prop_groups):
+    num, den = 0.0, 0.0
+    for _, row in scenario_data.iterrows():
+        m = safe_float(row[MASS_COL])
+        if np.isnan(m) or m <= 0:
+            continue
+        batch = row[BATCH_COL] if pd.notna(row[BATCH_COL]) else ""
+        cp = get_component_properties(row[COMP_COL], batch, props_dict, typical_dict)
+        num += m * _catalytic_element_sum(cp, chem_prop_groups)
+        den += m
+    return float(num / den) if den > 1e-9 else 0.0
+
+
+def _pair_frac_synergy(mass_by_type, tm, t1, t2):
+    """Геометрическое среднее долей массы типов (непрерывная «сила» пары)."""
+    a = max(mass_by_type.get(t1, 0.0) / tm, 1e-8)
+    b = max(mass_by_type.get(t2, 0.0) / tm, 1e-8)
+    return float(math.sqrt(a * b))
+
+
+def prepare_scenario_v2(
+    scenario_df, scenario_id, props_dict, typical_dict, numeric_props, chem_prop_groups
+):
     scenario_data = scenario_df[scenario_df[SCENARIO_COL] == scenario_id]
     test_params = scenario_data.iloc[0]
+
+    mass_by_type = {t: 0.0 for t in COMPONENT_TYPES}
+    total_mass = 0.0
+    for _, row in scenario_data.iterrows():
+        m = safe_float(row[MASS_COL])
+        if np.isnan(m) or m < 0:
+            m = 0.0
+        ct = get_component_type(row[COMP_COL])
+        if ct in mass_by_type:
+            mass_by_type[ct] += m
+        total_mass += m
+    tm = total_mass + 1e-9
+    frac_zddp = mass_by_type["zddp"] / tm
+    frac_base = mass_by_type["base_oil"] / tm
+    frac_ao = (
+        mass_by_type["ao_phenol"]
+        + mass_by_type["ao_amine"]
+        + mass_by_type["ao_other"]
+    ) / tm
+    frac_det_disp = (mass_by_type["detergent"] + mass_by_type["dispersant"]) / tm
+    frac_thick = mass_by_type["thickener"] / tm
+    frac_det = mass_by_type["detergent"] / tm
+    frac_disp = mass_by_type["dispersant"] / tm
+
+    temp = float(safe_float(test_params[TEMP_COL]) or 0.0)
+    time_h = float(safe_float(test_params[TIME_COL]) or 0.0)
+
+    tbn_d = _mass_weighted_max_prop_for_types(
+        scenario_data, props_dict, typical_dict, chem_prop_groups, "tbn", frozenset({"detergent"})
+    )
+    zn_z = _mass_weighted_max_prop_for_types(
+        scenario_data, props_dict, typical_dict, chem_prop_groups, "zn", frozenset({"zddp"})
+    )
+    ph_z = _mass_weighted_max_prop_for_types(
+        scenario_data, props_dict, typical_dict, chem_prop_groups, "phos", frozenset({"zddp"})
+    )
+    n_disp = _mass_weighted_max_prop_for_types(
+        scenario_data,
+        props_dict,
+        typical_dict,
+        chem_prop_groups,
+        "nitro_disp",
+        frozenset({"dispersant"}),
+    )
+
+    stress = math.log1p(max(temp, 0.0) / 55.0) * math.log1p(max(time_h, 0.0) / 6.0)
+    z_pack = max(0.5 * (zn_z + ph_z), 1e-6)
+    resource = math.log1p(1.0 + tbn_d) + math.log1p(1.0 + 12.0 * z_pack)
+    depletion = float(stress / (resource + 0.07))
+
+    thick_destruct = float(frac_thick * (max(temp, 0.0) / 150.0))
+    thick_crosslink = float(frac_thick * depletion)
+
+    cat_trace = _catalytic_trace_scenario(
+        scenario_data, props_dict, typical_dict, chem_prop_groups
+    )
+    disp_det_combo = float(frac_disp * frac_det)
 
     global_features = np.array(
         [
@@ -231,8 +498,20 @@ def prepare_scenario_v2(scenario_df, scenario_id, props_dict, typical_dict, nume
             safe_float(test_params[TIME_COL]),
             safe_float(test_params[BIO_COL]),
             safe_float(test_params[CAT_COL]),
-        ]
+            frac_zddp,
+            frac_base,
+            frac_ao,
+            frac_det_disp,
+            depletion,
+            thick_destruct,
+            thick_crosslink,
+            cat_trace,
+            n_disp,
+            disp_det_combo,
+        ],
+        dtype=float,
     )
+    assert global_features.shape[0] == GLOBAL_DIM
 
     components = []
     comp_types = []
@@ -256,7 +535,7 @@ def prepare_scenario_v2(scenario_df, scenario_id, props_dict, typical_dict, nume
                 prop_vals.append(0)
 
         if comp_type == "zddp":
-            p_zn_ratio = compute_zn_p_ratio(prop_vals, numeric_props[:NUM_PROPS])
+            p_zn_ratio = compute_zn_p_ratio(prop_vals, numeric_props)
         else:
             p_zn_ratio = 0.0
 
@@ -285,30 +564,15 @@ def prepare_scenario_v2(scenario_df, scenario_id, props_dict, typical_dict, nume
     mask = np.zeros((MAX_COMPONENTS,))
     mask[: min(len(scenario_data), MAX_COMPONENTS)] = 1
 
-    comp_types_set = set(comp_types)
-    has_phenol_amine = int(
-        "ao_phenol" in comp_types_set and "ao_amine" in comp_types_set
-    )
-    has_amine_molybdenum = int(
-        "ao_amine" in comp_types_set and "molybdenum" in comp_types_set
-    )
-    has_zddp_phenol = int("zddp" in comp_types_set and "ao_phenol" in comp_types_set)
-    has_detergent_zddp = int("detergent" in comp_types_set and "zddp" in comp_types_set)
-    has_dispersant_zddp = int("dispersant" in comp_types_set and "zddp" in comp_types_set)
-    has_thickener_zddp = int("thickener" in comp_types_set and "zddp" in comp_types_set)
-    has_phenol_molybdenum = int(
-        "ao_phenol" in comp_types_set and "molybdenum" in comp_types_set
-    )
-
     synergy_flags = np.array(
         [
-            has_phenol_amine,
-            has_amine_molybdenum,
-            has_zddp_phenol,
-            has_detergent_zddp,
-            has_dispersant_zddp,
-            has_thickener_zddp,
-            has_phenol_molybdenum,
+            _pair_frac_synergy(mass_by_type, tm, "ao_phenol", "ao_amine"),
+            _pair_frac_synergy(mass_by_type, tm, "ao_amine", "molybdenum"),
+            _pair_frac_synergy(mass_by_type, tm, "zddp", "ao_phenol"),
+            _pair_frac_synergy(mass_by_type, tm, "detergent", "zddp"),
+            _pair_frac_synergy(mass_by_type, tm, "dispersant", "zddp"),
+            _pair_frac_synergy(mass_by_type, tm, "thickener", "zddp"),
+            _pair_frac_synergy(mass_by_type, tm, "ao_phenol", "molybdenum"),
         ],
         dtype=float,
     )
@@ -500,7 +764,7 @@ def train_model_early_stop(
     synergy_train,
     synergy_val,
     scaler_y,
-    epochs=EPOCHS,
+    epochs=EPOCHS_KFOLD_VISC,
     lr=0.001,
     batch_size=BATCH_SIZE,
     weight_decay=5e-5,
@@ -509,8 +773,9 @@ def train_model_early_stop(
     use_smooth_l1=False,
     generator_seed=None,
     use_leaderboard_checkpoint=True,
+    checkpoint_min_delta=0.0,
 ):
-    """Чекпоинт по прокси лидерборда: MAE в z-пространстве (тот же scaler_y, fit на train фолда)."""
+    """Чекпоинт по MAE в z (тот же scaler_y). checkpoint_min_delta — порог улучшения score, чтобы не ловить шум val."""
     if generator_seed is None:
         generator_seed = RNG_SEED
     model = model.to(device)
@@ -587,7 +852,7 @@ def train_model_early_stop(
         else:
             score = val_loss
 
-        if score < best_score - 1e-9:
+        if score < best_score - checkpoint_min_delta:
             best_score = score
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             epochs_no_improve = 0
@@ -648,16 +913,39 @@ def main():
         if len(values) > 10:
             numeric_props.append(p)
 
-    PROPS_ORDER = numeric_props[:NUM_PROPS]
+    train_scenarios = train[SCENARIO_COL].unique()
+    y_visc_for_rank = []
+    y_oxid_for_rank = []
+    for sid in train_scenarios:
+        scenario_rows = train[train[SCENARIO_COL] == sid]
+        y_visc_for_rank.append(scenario_rows[TARGET_VISC].iloc[0])
+        y_oxid_for_rank.append(scenario_rows[TARGET_OXID].iloc[0])
+    PROPS_ORDER, prop_rank_scores = select_numeric_props_ranked(
+        train,
+        list(train_scenarios),
+        props_dict,
+        typical_dict,
+        numeric_props,
+        np.array(y_visc_for_rank),
+        np.array(y_oxid_for_rank),
+        NUM_PROPS,
+    )
+    top_dbg = prop_rank_scores[: min(10, len(prop_rank_scores))]
+    print(
+        "=== Ranked numeric props (mass-weighted |corr|, visc-weight="
+        f"{VISC_PROP_RANK_WEIGHT}) ==="
+    )
+    for t in top_dbg:
+        print(f"  {t[3][:70]:70s} comb={t[0]:.4f} |corr_v|={t[1]:.4f} |corr_o|={t[2]:.4f}")
+    print("Selected count:", len(PROPS_ORDER))
 
     print("=== Preparing data ===")
-    train_scenarios = train[SCENARIO_COL].unique()
     X_train_global, X_train_components, X_train_mask, X_train_synergy = [], [], [], []
     y_visc, y_oxid, train_ids = [], [], []
 
     for sid in train_scenarios:
         global_f, components, mask, synergy = prepare_scenario_v2(
-            train, sid, props_dict, typical_dict, PROPS_ORDER
+            train, sid, props_dict, typical_dict, PROPS_ORDER, chem_prop_groups
         )
         X_train_global.append(global_f)
         X_train_components.append(components)
@@ -687,7 +975,7 @@ def main():
 
     for sid in test_scenarios:
         global_f, components, mask, synergy = prepare_scenario_v2(
-            test, sid, props_dict, typical_dict, PROPS_ORDER
+            test, sid, props_dict, typical_dict, PROPS_ORDER, chem_prop_groups
         )
         X_test_global.append(global_f)
         X_test_components.append(components)
@@ -699,6 +987,10 @@ def main():
     X_test_components = np.array(X_test_components)
     X_test_mask = np.array(X_test_mask)
     X_test_synergy = np.array(X_test_synergy)
+
+    scaler_syn = StandardScaler()
+    X_train_synergy = scaler_syn.fit_transform(np.nan_to_num(X_train_synergy, nan=0))
+    X_test_synergy = scaler_syn.transform(np.nan_to_num(X_test_synergy, nan=0))
 
     scaler_g = StandardScaler()
     X_train_global_scaled = scaler_g.fit_transform(np.nan_to_num(X_train_global, nan=0))
@@ -742,7 +1034,8 @@ def main():
 
     comp_dim = X_train_components.shape[2]
     print(
-        f"Comp dim: {comp_dim} (cont={N_CONT_PER_COMP}, cat={N_CAT}), synergy={X_train_synergy.shape[1]}"
+        f"Comp dim: {comp_dim} (cont={N_CONT_PER_COMP}, cat={N_CAT}), "
+        f"synergy={X_train_synergy.shape[1]} (scaled), GLOBAL_DIM={GLOBAL_DIM}"
     )
 
     idx_train, idx_val = fold0_tr, fold0_va
@@ -782,10 +1075,12 @@ def main():
         synergy_train,
         synergy_val,
         scaler_visc_phase,
+        epochs=EPOCHS_PHASE1_MAX,
         model_name="DS_Viscosity",
         patience=PATIENCE,
         use_smooth_l1=True,
         use_leaderboard_checkpoint=True,
+        checkpoint_min_delta=CHECKPOINT_MIN_DELTA_VISC,
     )
     all_curves["ds_visc"] = (tr_l, val_l)
 
@@ -803,9 +1098,11 @@ def main():
         synergy_train,
         synergy_val,
         scaler_oxid_phase,
+        epochs=EPOCHS_PHASE1_MAX,
         model_name="DS_Oxidation",
         patience=PATIENCE,
         use_leaderboard_checkpoint=True,
+        checkpoint_min_delta=CHECKPOINT_MIN_DELTA_OXID,
     )
     all_curves["ds_oxid"] = (tr_l, val_l)
 
@@ -825,11 +1122,13 @@ def main():
         synergy_train,
         synergy_val,
         scaler_visc_phase,
-        lr=0.0005,
+        epochs=EPOCHS_PHASE1_MAX,
+        lr=LR_ST_VISC,
         model_name="ST_Viscosity",
         patience=PATIENCE,
         use_smooth_l1=True,
         use_leaderboard_checkpoint=True,
+        checkpoint_min_delta=CHECKPOINT_MIN_DELTA_VISC,
     )
     all_curves["st_visc"] = (tr_l, val_l)
 
@@ -849,10 +1148,12 @@ def main():
         synergy_train,
         synergy_val,
         scaler_oxid_phase,
+        epochs=EPOCHS_PHASE1_MAX,
         lr=0.0005,
         model_name="ST_Oxidation",
         patience=PATIENCE,
         use_leaderboard_checkpoint=True,
+        checkpoint_min_delta=CHECKPOINT_MIN_DELTA_OXID,
     )
     all_curves["st_oxid"] = (tr_l, val_l)
 
@@ -862,6 +1163,8 @@ def main():
     pred_st_oxid_list = []
     full_curves = None
     kfold_loss_log = []
+    oof_ds_visc = np.zeros(len(y_visc), dtype=float)
+    oof_st_visc = np.zeros(len(y_visc), dtype=float)
 
     for fold, (tr_idx, va_idx) in enumerate(kf_splits):
         set_seed(RNG_SEED + fold)
@@ -902,12 +1205,13 @@ def main():
             syn_tr,
             syn_va,
             scaler_visc_f,
-            epochs=EPOCHS,
+            epochs=EPOCHS_KFOLD_VISC,
             model_name=f"DS_Viscosity_fold{fold}",
             patience=None,
             use_smooth_l1=True,
             generator_seed=RNG_SEED + fold,
             use_leaderboard_checkpoint=True,
+            checkpoint_min_delta=CHECKPOINT_MIN_DELTA_VISC,
         )
         curves_fold["ds_visc"] = _loss_curves_payload(tr_f, val_f)
         if fold == 0:
@@ -927,11 +1231,12 @@ def main():
             syn_tr,
             syn_va,
             scaler_oxid_f,
-            epochs=EPOCHS,
+            epochs=EPOCHS_KFOLD_OXID,
             model_name=f"DS_Oxidation_fold{fold}",
-            patience=None,
+            patience=PATIENCE_KFOLD_OXID,
             generator_seed=RNG_SEED + fold + 7,
             use_leaderboard_checkpoint=True,
+            checkpoint_min_delta=CHECKPOINT_MIN_DELTA_OXID,
         )
         curves_fold["ds_oxid"] = _loss_curves_payload(tr_f, val_f)
         if fold == 0:
@@ -953,17 +1258,35 @@ def main():
             syn_tr,
             syn_va,
             scaler_visc_f,
-            lr=0.0005,
-            epochs=EPOCHS,
+            lr=LR_ST_VISC,
+            epochs=EPOCHS_KFOLD_VISC,
             model_name=f"ST_Viscosity_fold{fold}",
             patience=None,
             use_smooth_l1=True,
             generator_seed=RNG_SEED + fold + 13,
             use_leaderboard_checkpoint=True,
+            checkpoint_min_delta=CHECKPOINT_MIN_DELTA_VISC,
         )
         curves_fold["st_visc"] = _loss_curves_payload(tr_f, val_f)
         if fold == 0:
             full_curves["st_visc"] = (tr_f, val_f)
+
+        oof_ds_visc[va_idx] = predict_model(
+            ds_visc,
+            X_train_global_scaled[va_idx],
+            X_train_components[va_idx],
+            X_train_mask[va_idx],
+            X_train_synergy[va_idx],
+            scaler_visc_f,
+        )
+        oof_st_visc[va_idx] = predict_model(
+            st_visc,
+            X_train_global_scaled[va_idx],
+            X_train_components[va_idx],
+            X_train_mask[va_idx],
+            X_train_synergy[va_idx],
+            scaler_visc_f,
+        )
 
         st_oxid = SetTransformer(
             comp_dim, GLOBAL_DIM, HIDDEN_DIM, NUM_HEADS, NUM_ISAB, ENCODE_DIM
@@ -982,11 +1305,12 @@ def main():
             syn_va,
             scaler_oxid_f,
             lr=0.0005,
-            epochs=EPOCHS,
+            epochs=EPOCHS_KFOLD_OXID,
             model_name=f"ST_Oxidation_fold{fold}",
-            patience=None,
+            patience=PATIENCE_KFOLD_OXID,
             generator_seed=RNG_SEED + fold + 19,
             use_leaderboard_checkpoint=True,
+            checkpoint_min_delta=CHECKPOINT_MIN_DELTA_OXID,
         )
         curves_fold["st_oxid"] = _loss_curves_payload(tr_f, val_f)
         if fold == 0:
@@ -1047,14 +1371,34 @@ def main():
     pred_ds_oxid = np.mean(np.stack(pred_ds_oxid_list, axis=0), axis=0)
     pred_st_oxid = np.mean(np.stack(pred_st_oxid_list, axis=0), axis=0)
 
+    w_visc_st, oof_visc_mae = optimize_visc_st_blend_weight(
+        oof_ds_visc, oof_st_visc, y_visc
+    )
+    print(
+        f"\nOOF viscosity blend: w_ST={w_visc_st:.4f}, w_DS={1.0 - w_visc_st:.4f} "
+        f"(MAE on full train OOF={oof_visc_mae:.4f})"
+    )
+
     metrics_payload = {
         "config": {
-            "EPOCHS": EPOCHS,
+            "EPOCHS_PHASE1_MAX": EPOCHS_PHASE1_MAX,
+            "EPOCHS_KFOLD_VISC": EPOCHS_KFOLD_VISC,
+            "EPOCHS_KFOLD_OXID": EPOCHS_KFOLD_OXID,
+            "PATIENCE_KFOLD_OXID": PATIENCE_KFOLD_OXID,
+            "CHECKPOINT_MIN_DELTA_VISC": CHECKPOINT_MIN_DELTA_VISC,
+            "CHECKPOINT_MIN_DELTA_OXID": CHECKPOINT_MIN_DELTA_OXID,
+            "LR_ST_VISC": LR_ST_VISC,
             "PATIENCE_phase1": PATIENCE,
             "K_FOLD": K_FOLD,
             "BATCH_SIZE": BATCH_SIZE,
             "device": str(device),
             "RNG_SEED": RNG_SEED,
+            "GLOBAL_DIM": GLOBAL_DIM,
+            "VISC_PROP_RANK_WEIGHT": VISC_PROP_RANK_WEIGHT,
+            "visc_oof_blend_w_st": w_visc_st,
+            "visc_oof_blend_mae": oof_visc_mae,
+            "PROPS_ORDER": list(PROPS_ORDER),
+            "chem_prop_group_counts": {k: len(v) for k, v in chem_prop_groups.items()},
         },
         "phase1_fold0_early_stop": {
             k: _loss_curves_payload(tr, va) for k, (tr, va) in all_curves.items()
@@ -1074,10 +1418,10 @@ def main():
         "ST — Oxidation (K-fold fold0)",
     ]
     titles_full = [
-        f"DS — Viscosity (fold0 final, {EPOCHS} ep, best MAE_z)",
-        f"DS — Oxidation (fold0 final, {EPOCHS} ep, best MAE_z)",
-        f"ST — Viscosity (fold0 final, {EPOCHS} ep, best MAE_z)",
-        f"ST — Oxidation (fold0 final, {EPOCHS} ep, best MAE_z)",
+        f"DS — Viscosity (fold0, {EPOCHS_KFOLD_VISC} ep, best MAE_z)",
+        f"DS — Oxidation (fold0, {EPOCHS_KFOLD_OXID} ep, best MAE_z)",
+        f"ST — Viscosity (fold0, {EPOCHS_KFOLD_VISC} ep, best MAE_z)",
+        f"ST — Oxidation (fold0, {EPOCHS_KFOLD_OXID} ep, best MAE_z)",
     ]
 
     fig, axes = plt.subplots(4, 2, figsize=(14, 20))
@@ -1113,7 +1457,7 @@ def main():
     plt.close()
     print(f"\nSaved: {curves_path}")
 
-    pred_visc = 0.6 * pred_st_visc + 0.4 * pred_ds_visc
+    pred_visc = w_visc_st * pred_st_visc + (1.0 - w_visc_st) * pred_ds_visc
     pred_oxid = (pred_ds_oxid + pred_st_oxid) / 2
     pred_oxid = np.maximum(pred_oxid, 0.0)
 
